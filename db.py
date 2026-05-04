@@ -2,8 +2,8 @@ import mysql.connector
 
 def get_db_connection():
     return mysql.connector.connect(
-    host="localhost",
-    user="root",
-    password="",
-    database="hospital_system"
+    host="mysql-derrick.alwaysdata.net",
+    user="derrick",
+    password="modcom2026",
+    database="derrick_hospital"
 )
