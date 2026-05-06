@@ -1,10 +1,20 @@
 from flask import Flask, request, jsonify
 from db import get_db_connection
 from flask_cors import CORS
-
-# caculation for age
 from datetime import datetime
+import jwt
+import datetime as dt
+import bcrypt
+from functools import wraps
 
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+SECRET_KEY = "mysecretkey"
+
+# =========================
+# AGE HELPER
+# =========================
 def calculate_age(dob):
     today = datetime.today()
     birth_date = datetime.strptime(dob, "%Y-%m-%d")
@@ -12,26 +22,58 @@ def calculate_age(dob):
         (today.month, today.day) < (birth_date.month, birth_date.day)
     )
 
+# =========================
+# TOKEN MIDDLEWARE
+# =========================
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
 
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+        auth = request.headers.get("Authorization")
 
-# ---------------------------
-# LOGIN ROUTE (SAFE)
-# ---------------------------
+        if auth and " " in auth:
+            token = auth.split(" ")[1]
+
+        if not token:
+            return jsonify({"error": "Token missing"}), 401
+
+        try:
+            data = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+            request.user = data
+        except:
+            return jsonify({"error": "Invalid token"}), 401
+
+        return f(*args, **kwargs)
+
+    return decorated
+
+# =========================
+# ROLE MIDDLEWARE
+# =========================
+def role_required(*roles):
+    def wrapper(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            if not hasattr(request, "user"):
+                return jsonify({"error": "Unauthorized"}), 401
+
+            if request.user.get("role") not in roles:
+                return jsonify({"error": "Forbidden"}), 403
+
+            return f(*args, **kwargs)
+        return decorated
+    return wrapper
+
+# =========================
+# LOGIN
+# =========================
 @app.route('/login', methods=['POST'])
 def login():
     try:
-        import jwt
-        import datetime
-
         data = request.get_json()
-
         username = data.get("username")
         password = data.get("password")
-
-        if not username or not password:
-            return jsonify({"error": "Missing credentials"}), 400
 
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
@@ -45,22 +87,23 @@ def login():
         if not user:
             return jsonify({"error": "Invalid credentials"}), 401
 
-        # ✅ plain text comparison
-        if user["password"] != password:
-            return jsonify({"error": "Invalid credentials"}), 401
+        if user.get("status") == "disabled":
+            return jsonify({"error": "Account disabled"}), 403
 
-        token = jwt.encode(
-            {
-                "user_id": user["id"],
-                "role": user["role"],
-                "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=3)
-            },
-            "mysecretkey",
-            algorithm="HS256"
-        )
+        stored = user["password"]
 
-        if isinstance(token, bytes):
-            token = token.decode("utf-8")
+        if stored.startswith("$2b$"):
+            if not bcrypt.checkpw(password.encode(), stored.encode()):
+                return jsonify({"error": "Invalid credentials"}), 401
+        else:
+            if password != stored:
+                return jsonify({"error": "Invalid credentials"}), 401
+
+        token = jwt.encode({
+            "user_id": user["id"],
+            "role": user["role"],
+            "exp": dt.datetime.utcnow() + dt.timedelta(hours=3)
+        }, SECRET_KEY, algorithm="HS256")
 
         return jsonify({
             "token": token,
@@ -69,341 +112,285 @@ def login():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-# ---------------------------
-# ADD MEDICAL RECORD
-# ---------------------------
 
-
-# ---------------------------
-# GET ALL PATIENTS
-# ---------------------------
+# =========================
+# PATIENTS
+# =========================
 @app.route('/patients', methods=['GET'])
+@token_required
+@role_required('doctor', 'reception', 'pharmacy', 'admin')
 def get_patients():
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
 
-        cursor.execute("SELECT * FROM patients ORDER BY id DESC")
-        patients = cursor.fetchall()
+    cursor.execute("SELECT * FROM patients ORDER BY created_at DESC")
+    data = cursor.fetchall()
 
-        cursor.close()
-        conn.close()
+    cursor.close()
+    conn.close()
 
-        return jsonify(patients), 200
+    return jsonify(data)
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ---------------------------
-# GET SINGLE PATIENT
-# ---------------------------
-@app.route('/patient/<int:id>', methods=['GET'])
+# =========================
+# SINGLE PATIENT
+# =========================
+@app.route('/patient/<int:id>')
+@token_required
 def get_patient(id):
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
 
-        cursor.execute("SELECT * FROM patients WHERE id = %s", (id,))
-        patient = cursor.fetchone()
+    cursor.execute("SELECT * FROM patients WHERE id=%s", (id,))
+    data = cursor.fetchone()
 
-        cursor.close()
-        conn.close()
+    cursor.close()
+    conn.close()
 
-        return jsonify(patient), 200
+    return jsonify(data)
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+# =========================
+# SEARCH
+# =========================
+@app.route('/patients/search')
+@token_required
+def search_patients():
+    q = request.args.get("q", "")
 
+    if not q:
+        return jsonify([])
 
-# ---------------------------
-# GET MEDICAL RECORDS
-# ---------------------------
-@app.route('/records/<int:patient_id>', methods=['GET'])
-def get_records(patient_id):
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
 
-        cursor.execute("""
-            SELECT * FROM medical_records
-            WHERE patient_id = %s
-            ORDER BY id DESC
-        """, (patient_id,))
+    like = f"%{q}%"
 
-        records = cursor.fetchall()
+    cursor.execute("""
+        SELECT id, first_name, last_name, national_id, guardian_national_id, patient_type
+        FROM patients
+        WHERE CAST(id AS CHAR) LIKE %s
+        OR first_name LIKE %s
+        OR last_name LIKE %s
+        OR national_id LIKE %s
+        OR guardian_national_id LIKE %s
+        LIMIT 10
+    """, (like, like, like, like, like))
 
-        cursor.close()
-        conn.close()
+    data = cursor.fetchall()
 
-        return jsonify(records), 200
+    cursor.close()
+    conn.close()
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return jsonify(data)
 
-
-# ---------------------------
-# PHARMACY: GET RECORDS
-# ---------------------------
-@app.route('/pharmacy/records/nid/<national_id>', methods=['GET'])
-def pharmacy_records_by_nid(national_id):
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-
-        # 1. Get patient by national ID
-        cursor.execute("""
-            SELECT * FROM patients WHERE national_id = %s
-        """, (national_id,))
-        patient = cursor.fetchone()
-
-        if not patient:
-            return jsonify({"error": "Patient not found"}), 404
-
-        # 2. Get ONLY pending records
-        cursor.execute("""
-            SELECT id, diagnosis, prescription, status, created_at
-            FROM medical_records
-            WHERE patient_id = %s AND status = 'PENDING'
-            ORDER BY id DESC
-        """, (patient['id'],))
-
-        records = cursor.fetchall()
-
-        cursor.close()
-        conn.close()
-
-        return jsonify({
-            "patient": patient,
-            "records": records
-        }), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ---------------------------
-# PHARMACY: DISPENSE
-# ---------------------------
-@app.route('/pharmacy/dispense/<int:record_id>', methods=['PUT'])
-def dispense_medication(record_id):
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            UPDATE medical_records
-            SET status = 'DISPENSED'
-            WHERE id = %s
-        """, (record_id,))
-
-        conn.commit()
-        cursor.close()
-        conn.close()
-
-        return jsonify({"message": "Medication dispensed"}), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# queue route
-@app.route('/pharmacy/queue', methods=['GET'])
-def pharmacy_queue():
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-
-        cursor.execute("""
-    SELECT 
-        m.id,
-        m.diagnosis,
-        m.prescription,
-        m.status,
-        m.created_at,
-        p.first_name,
-        p.last_name,
-        p.national_id
-    FROM medical_records m
-    JOIN patients p ON m.patient_id = p.id
-    WHERE m.status = 'PENDING'
-    ORDER BY m.created_at DESC
-""")
-
-        queue = cursor.fetchall()
-
-        cursor.close()
-        conn.close()
-
-        return jsonify(queue), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ---------------------------
-# SEARCH BY NATIONAL ID
-# ---------------------------
-@app.route('/patient/search/<national_id>', methods=['GET'])
-def search_patient_by_nid(national_id):
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-
-        cursor.execute("""
-            SELECT * FROM patients WHERE national_id = %s
-        """, (national_id,))
-        patient = cursor.fetchone()
-
-        if not patient:
-            return jsonify({"error": "Patient not found"}), 404
-
-        cursor.execute("""
-            SELECT * FROM medical_records
-            WHERE patient_id = %s
-            ORDER BY id DESC
-        """, (patient['id'],))
-        records = cursor.fetchall()
-
-        cursor.close()
-        conn.close()
-
-        return jsonify({
-            "patient": patient,
-            "records": records
-        }), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ---------------------------
-# ADD PATIENT (RECEPTION)
-# ---------------------------
+# =========================
+# ADD PATIENT
+# =========================
 @app.route('/add_patient', methods=['POST'])
+@token_required
+@role_required('reception', 'admin')
 def add_patient():
-    try:
-        data = request.get_json(force=True)
+    data = request.get_json()
 
-        # =========================
-        # EXTRACT DATA
-        # =========================
-        first_name = data.get('first_name')
-        last_name = data.get('last_name')
-        gender = data.get('gender')
-        phone = data.get('phone')
-        date_of_birth = data.get('date_of_birth')
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-        national_id = data.get('national_id')
-        guardian_id = data.get('guardian_national_id')
+    age = calculate_age(data["date_of_birth"])
+    ptype = "ADULT" if age >= 18 else "CHILD"
 
-        # =========================
-        # VALIDATION
-        # =========================
-        if not first_name or not last_name:
-            return jsonify({"error": "First name and last name are required"}), 400
+    cursor.execute("""
+        INSERT INTO patients
+        (first_name,last_name,gender,phone,date_of_birth,national_id,guardian_national_id,patient_type)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        data["first_name"],
+        data["last_name"],
+        data["gender"],
+        data["phone"],
+        data["date_of_birth"],
+        data.get("national_id"),
+        data.get("guardian_national_id"),
+        ptype
+    ))
 
-        if not date_of_birth:
-            return jsonify({"error": "Date of birth is required"}), 400
+    conn.commit()
+    cursor.close()
+    conn.close()
 
-        # =========================
-        # AUTO DETECT PATIENT TYPE
-        # =========================
-        age = calculate_age(date_of_birth)
+    return jsonify({"message": "Patient added"})
 
-        if age < 18:
-            patient_type = "CHILD"
-        else:
-            patient_type = "ADULT"
-
-        # =========================
-        # BUSINESS RULES
-        # =========================
-        if patient_type == "ADULT":
-            if not national_id:
-                return jsonify({"error": "Adult must have national ID"}), 400
-            guardian_id = None
-
-        if patient_type == "CHILD":
-            if not guardian_id:
-                return jsonify({"error": "Child must have guardian national ID"}), 400
-            national_id = None
-
-        # =========================
-        # INSERT
-        # =========================
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            INSERT INTO patients 
-            (first_name, last_name, gender, phone, date_of_birth, national_id, guardian_national_id, patient_type)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """, (
-            first_name,
-            last_name,
-            gender,
-            phone,
-            date_of_birth,
-            national_id,
-            guardian_id,
-            patient_type
-        ))
-
-        conn.commit()
-        cursor.close()
-        conn.close()
-
-        return jsonify({
-            "message": "Patient registered successfully",
-            "patient_type": patient_type,
-            "age": age
-        }), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-# add record route
+# =========================
+# ADD RECORD
+# =========================
 @app.route('/add_record', methods=['POST'])
+@token_required
+@role_required('doctor', 'admin')
 def add_record():
-    try:
-        data = request.get_json(force=True)
+    data = request.get_json()
 
-        if not data:
-            return jsonify({"error": "No data received"}), 400
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-        patient_id = data.get('patient_id')
-        diagnosis = data.get('diagnosis')
-        test_results = data.get('test_results')
-        prescription = data.get('prescription')
+    cursor.execute("""
+        INSERT INTO medical_records
+        (patient_id, diagnosis, test_results, prescription, status)
+        VALUES (%s,%s,%s,%s,'PENDING')
+    """, (
+        data["patient_id"],
+        data["diagnosis"],
+        data.get("test_results"),
+        data.get("prescription")
+    ))
 
-        if not patient_id:
-            return jsonify({"error": "patient_id is required"}), 400
+    conn.commit()
+    cursor.close()
+    conn.close()
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
+    return jsonify({"message": "Record added"})
 
-        # ✅ IMPORTANT: status is set to PENDING by default
-        cursor.execute("""
-            INSERT INTO medical_records 
-            (patient_id, diagnosis, test_results, prescription, status)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (
-            patient_id,
-            diagnosis,
-            test_results,
-            prescription,
-            "PENDING"
-        ))
+# =========================
+# RECORDS
+# =========================
+@app.route('/records/<int:patient_id>')
+@token_required
+def get_records(patient_id):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
 
-        conn.commit()
-        cursor.close()
-        conn.close()
+    cursor.execute("""
+        SELECT * FROM medical_records
+        WHERE patient_id=%s
+        ORDER BY created_at DESC
+    """, (patient_id,))
 
-        return jsonify({"message": "Record added successfully"}), 200
+    data = cursor.fetchall()
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    cursor.close()
+    conn.close()
 
+    return jsonify(data)
 
+# =========================
+# PHARMACY + ADMIN
+# =========================
+@app.route('/pharmacy/queue')
+@token_required
+@role_required('pharmacy', 'admin')
+def pharmacy_queue():
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
 
-# ⚠️ DO NOT USE app.run() ON ALWAYSDATA
-# if __name__ == '__main__':
-#     app.run(debug=True)
+    cursor.execute("""
+        SELECT m.*, p.first_name, p.last_name
+        FROM medical_records m
+        JOIN patients p ON p.id = m.patient_id
+        WHERE m.status='PENDING'
+    """)
+
+    data = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    return jsonify(data)
+
+@app.route('/pharmacy/dispense/<int:id>', methods=['PUT'])
+@token_required
+@role_required('pharmacy', 'admin')
+def dispense(id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE medical_records
+        SET status='DISPENSED'
+        WHERE id=%s
+    """, (id,))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return jsonify({"message": "Dispensed"})
+
+# =========================
+# ADMIN USERS
+# =========================
+@app.route('/admin/users', methods=['POST'])
+@token_required
+@role_required('admin')
+def create_user():
+    data = request.get_json()
+
+    hashed = bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt()).decode()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO users (username,password,role,status)
+        VALUES (%s,%s,%s,'active')
+    """, (data["username"], hashed, data["role"]))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return jsonify({"message": "User created"})
+
+@app.route('/admin/users')
+@token_required
+@role_required('admin')
+def get_users():
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("SELECT id,username,role,status FROM users")
+    data = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    return jsonify(data)
+
+@app.route('/admin/users/<int:id>', methods=['DELETE'])
+@token_required
+@role_required('admin')
+def disable_user(id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("UPDATE users SET status='disabled' WHERE id=%s", (id,))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return jsonify({"message": "User disabled"})
+
+@app.route("/")
+def home():
+    return "Server is running"
+
+# =========================
+# ADMIN FULL PATIENT VIEW
+# =========================
+@app.route('/admin/patient/<int:id>')
+@token_required
+@role_required('admin')
+def admin_patient(id):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("SELECT * FROM patients WHERE id=%s", (id,))
+    patient = cursor.fetchone()
+
+    cursor.execute("SELECT * FROM medical_records WHERE patient_id=%s", (id,))
+    records = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    return jsonify({"patient": patient, "records": records})
+
+# if __name__ == "__main__":
+#     app.run()
